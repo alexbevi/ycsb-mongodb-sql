@@ -586,29 +586,29 @@ def comparison_rows(phase: str) -> list[tuple[str, Sequence[str], bool]]:
     ]
 
 
-def write_comparison_table(result_dir: Path, target_name: str, phases: Sequence[str]) -> Path:
+def write_comparison_table(result_dir: Path, left_name: str, right_name: str, phases: Sequence[str]) -> Path:
     path = result_dir / "comparison.md"
     lines = [
-        f"# smongo vs {target_name}",
+        f"# {left_name} vs {right_name}",
         "",
     ]
     for phase in phases:
-        smongo_metrics = parse_ycsb_metrics(result_dir / "smongo" / f"{phase}.txt")
-        target_metrics = parse_ycsb_metrics(result_dir / target_name / f"{phase}.txt")
-        if not smongo_metrics and not target_metrics:
+        left_metrics = parse_ycsb_metrics(result_dir / left_name / f"{phase}.txt")
+        right_metrics = parse_ycsb_metrics(result_dir / right_name / f"{phase}.txt")
+        if not left_metrics and not right_metrics:
             continue
         lines.extend(
             [
                 f"## {phase}",
                 "",
-                f"| Metric | smongo | {target_name} |",
+                f"| Metric | {left_name} | {right_name} |",
                 "| --- | ---: | ---: |",
             ]
         )
         for label, keys, integer in comparison_rows(phase):
-            smongo_value = format_metric(metric_value(smongo_metrics, keys), integer=integer)
-            target_value = format_metric(metric_value(target_metrics, keys), integer=integer)
-            lines.append(f"| {label} | {smongo_value} | {target_value} |")
+            left_value = format_metric(metric_value(left_metrics, keys), integer=integer)
+            right_value = format_metric(metric_value(right_metrics, keys), integer=integer)
+            lines.append(f"| {label} | {left_value} | {right_value} |")
         lines.append("")
     path.write_text("\n".join(lines), encoding="utf-8")
     return path
@@ -652,6 +652,11 @@ def parse_args() -> argparse.Namespace:
         "--compare-smongo",
         action="store_true",
         help="Run smongo and the selected target, then write a side-by-side comparison table",
+    )
+    parser.add_argument(
+        "--compare-to",
+        choices=sorted(TARGETS),
+        help="Run the selected target and this second target, then write a side-by-side comparison table",
     )
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument(
@@ -741,31 +746,45 @@ def run_benchmark(args: argparse.Namespace, result_dir: Path) -> list[str]:
                 smongo_process.kill()
 
 
-def compare_smongo(args: argparse.Namespace) -> None:
-    if args.target == "smongo":
-        raise SystemExit("--compare-smongo requires a target other than smongo")
+def benchmark_args(args: argparse.Namespace, target_name: str) -> argparse.Namespace:
+    copied = copy.copy(args)
+    copied.target = target_name
+    copied.compare_smongo = False
+    copied.compare_to = None
+    if target_name != args.target:
+        copied.uri = None
+        copied.jdbc_driver = None
+        copied.jdbc_url = None
+        copied.jdbc_user = ""
+        copied.jdbc_password = ""
+        copied.jdbc_jar = None
+    return copied
+
+
+def compare_targets(args: argparse.Namespace, left_name: str, right_name: str) -> None:
+    if left_name == right_name:
+        raise SystemExit("comparison targets must be different")
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    result_dir = args.output_dir / f"compare-smongo-{args.target}" / stamp
+    result_dir = args.output_dir / f"compare-{left_name}-{right_name}" / stamp
 
-    smongo_args = copy.copy(args)
-    smongo_args.target = "smongo"
-    smongo_args.uri = None
-    smongo_args.no_docker = True
+    left_args = benchmark_args(args, left_name)
+    right_args = benchmark_args(args, right_name)
 
-    target_args = copy.copy(args)
-    target_args.compare_smongo = False
-
-    phases = run_benchmark(smongo_args, result_dir / "smongo")
-    run_benchmark(target_args, result_dir / args.target)
-    comparison = write_comparison_table(result_dir, args.target, phases)
+    phases = run_benchmark(left_args, result_dir / left_name)
+    run_benchmark(right_args, result_dir / right_name)
+    comparison = write_comparison_table(result_dir, left_name, right_name, phases)
     print(comparison.read_text(encoding="utf-8"))
     print(f"Comparison: {comparison}")
 
 
 def main() -> int:
     args = parse_args()
+    if args.compare_smongo and args.compare_to:
+        raise SystemExit("use only one of --compare-smongo or --compare-to")
     if args.compare_smongo:
-        compare_smongo(args)
+        compare_targets(args, "smongo", args.target)
+    elif args.compare_to:
+        compare_targets(args, args.target, args.compare_to)
     else:
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         run_benchmark(args, args.output_dir / args.target / stamp)
