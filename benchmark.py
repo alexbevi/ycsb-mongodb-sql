@@ -690,13 +690,14 @@ def parse_metric_number(value: str) -> float | None:
         return None
 
 
-def difference_marker(source_value: float, target_value: float, higher_is_better: bool | None) -> str:
-    if source_value == target_value:
-        return "0"
+def difference_percentage(source_value: float, target_value: float, higher_is_better: bool | None) -> float | None:
+    if target_value == 0:
+        return None
     if higher_is_better is None:
-        return "+" if source_value > target_value else "-"
-    source_better = source_value > target_value if higher_is_better else source_value < target_value
-    return "+" if source_better else "-"
+        return (source_value - target_value) / target_value
+    if higher_is_better:
+        return (source_value - target_value) / target_value
+    return (target_value - source_value) / target_value
 
 
 def format_difference(source: str, target: str, *, integer: bool, higher_is_better: bool | None) -> str:
@@ -704,7 +705,10 @@ def format_difference(source: str, target: str, *, integer: bool, higher_is_bett
     target_number = parse_metric_number(target)
     if source_number is None or target_number is None:
         return "-"
-    return difference_marker(source_number, target_number, higher_is_better)
+    percentage = difference_percentage(source_number, target_number, higher_is_better)
+    if percentage is None:
+        return "n/a"
+    return f"{percentage:+,.2%}"
 
 
 def versioned_label(name: str, version: str | None) -> str:
