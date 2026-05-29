@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shlex
 import shutil
 import socket
 import sqlite3
@@ -194,16 +195,26 @@ def download_jars(spec: str) -> list[Path]:
     return [download_jar(item.strip()) for item in spec.split(",") if item.strip()]
 
 
-def write_ycsb_setenv(home: Path, classpath: Sequence[Path]) -> None:
+def write_ycsb_setenv(
+    home: Path,
+    classpath: Sequence[Path],
+    java_opts: Sequence[str],
+) -> None:
     setenv = home / "bin" / "setenv.sh"
-    if not classpath:
+    if not classpath and not java_opts:
         try:
             setenv.unlink()
         except FileNotFoundError:
             pass
         return
-    joined = ":".join(str(path) for path in classpath)
-    setenv.write_text(f'CLASSPATH="$CLASSPATH:{joined}"\n', encoding="utf-8")
+    lines = []
+    if classpath:
+        joined = ":".join(str(path) for path in classpath)
+        lines.append(f'CLASSPATH="$CLASSPATH:{joined}"')
+    if java_opts:
+        joined_opts = " ".join(shlex.quote(opt) for opt in java_opts)
+        lines.append(f'JAVA_OPTS="${{JAVA_OPTS:-}} {joined_opts}"')
+    setenv.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def register_ycsb_binding(home: Path, name: str, class_name: str) -> None:
@@ -496,6 +507,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--jdbc-user", default="")
     parser.add_argument("--jdbc-password", default="")
     parser.add_argument("--jdbc-jar", help="Path or URL to the JDBC driver jar")
+    parser.add_argument(
+        "--java-opt",
+        action="append",
+        default=[],
+        help="Additional JVM option for YCSB; repeat for multiple options",
+    )
     parser.add_argument("--smongo-db-path")
     parser.add_argument("--no-docker", action="store_true", help="Do not start Docker services")
     parser.add_argument("--no-reset", action="store_true", help="Do not reset SQL tables before load")
@@ -539,9 +556,9 @@ def main() -> int:
                 raise SystemExit(f"--target {args.target} requires --uri")
             if target.ycsb_db == "modern-mongodb":
                 classpath = ensure_modern_mongo_binding(home)
-                write_ycsb_setenv(home, classpath)
+                write_ycsb_setenv(home, classpath, args.java_opt)
             else:
-                write_ycsb_setenv(home, [])
+                write_ycsb_setenv(home, [], args.java_opt)
             extra_props.extend([f"mongodb.url={uri}", "mongodb.upsert=true"])
         else:
             jdbc_driver = args.jdbc_driver or target.jdbc_driver
@@ -555,7 +572,7 @@ def main() -> int:
             if not jdbc_driver or not jdbc_url or not jdbc_jar:
                 raise SystemExit("JDBC targets require --jdbc-driver, --jdbc-url, and --jdbc-jar")
             classpath = download_jars(jdbc_jar)
-            write_ycsb_setenv(home, classpath)
+            write_ycsb_setenv(home, classpath, args.java_opt)
             props_file = result_dir / "jdbc.properties"
             write_jdbc_props(props_file, driver=jdbc_driver, url=jdbc_url, user=jdbc_user, password=jdbc_password)
 
