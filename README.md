@@ -77,8 +77,8 @@ The table header includes the actual database version detected at runtime when
 the target exposes one. For example, the MongoDB column uses the server version
 returned by `buildInfo`, not the Docker image tag. The table includes load/run
 throughput plus key read, insert, and update latency metrics. The `Difference`
-column is green when the source is better than the target and red when it is
-worse; higher throughput is better, lower latency is better.
+column uses a leading `+` when the source is better than the target and `-`
+when it is worse; higher throughput is better, lower latency is better.
 
 Raw outputs remain available as:
 

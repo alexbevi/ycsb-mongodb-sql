@@ -690,12 +690,13 @@ def parse_metric_number(value: str) -> float | None:
         return None
 
 
-def color_difference(text: str, source_value: float, target_value: float, higher_is_better: bool | None) -> str:
-    if source_value == target_value or higher_is_better is None:
-        return text
+def difference_marker(source_value: float, target_value: float, higher_is_better: bool | None) -> str:
+    if source_value == target_value:
+        return "0"
+    if higher_is_better is None:
+        return "+" if source_value > target_value else "-"
     source_better = source_value > target_value if higher_is_better else source_value < target_value
-    color = "green" if source_better else "red"
-    return f'<span style="color: {color}">{text}</span>'
+    return "+" if source_better else "-"
 
 
 def format_difference(source: str, target: str, *, integer: bool, higher_is_better: bool | None) -> str:
@@ -703,13 +704,7 @@ def format_difference(source: str, target: str, *, integer: bool, higher_is_bett
     target_number = parse_metric_number(target)
     if source_number is None or target_number is None:
         return "-"
-    delta = source_number - target_number
-    delta_text = f"{int(delta):+,}" if integer else f"{delta:+,.2f}"
-    if target_number:
-        delta_text = f"{delta_text} ({delta / target_number:+,.2%})"
-    else:
-        delta_text = f"{delta_text} (n/a)"
-    return color_difference(delta_text, source_number, target_number, higher_is_better)
+    return difference_marker(source_number, target_number, higher_is_better)
 
 
 def versioned_label(name: str, version: str | None) -> str:
