@@ -30,6 +30,11 @@ REPO_ROOT = Path(__file__).resolve().parent
 CACHE_DIR = REPO_ROOT / ".bench"
 RESULTS_DIR = REPO_ROOT / "results"
 COMPOSE_FILE = REPO_ROOT / "docker-compose.yml"
+MODERN_MONGO_DRIVER_JARS = (
+    "https://repo1.maven.org/maven2/org/mongodb/mongodb-driver-sync/4.11.4/mongodb-driver-sync-4.11.4.jar,"
+    "https://repo1.maven.org/maven2/org/mongodb/mongodb-driver-core/4.11.4/mongodb-driver-core-4.11.4.jar,"
+    "https://repo1.maven.org/maven2/org/mongodb/bson/4.11.4/bson-4.11.4.jar"
+)
 
 
 @dataclass(frozen=True)
@@ -66,18 +71,15 @@ TARGETS: dict[str, Target] = {
     ),
     "ferretdb": Target(
         binding="mongodb",
-        ycsb_db="mongodb",
+        ycsb_db="modern-mongodb",
         docker_service="ferretdb",
         wait_host="127.0.0.1",
         wait_port=27019,
-        default_uri=(
-            "mongodb://username:password@127.0.0.1:27019/ycsb"
-            "?authMechanism=PLAIN&w=1"
-        ),
+        default_uri="mongodb://username:password@127.0.0.1:27019/ycsb?w=1",
     ),
     "documentdb": Target(
         binding="mongodb",
-        ycsb_db="mongodb",
+        ycsb_db="modern-mongodb",
         default_uri=os.environ.get("DOCUMENTDB_URI"),
         requires_uri=True,
     ),
@@ -202,6 +204,35 @@ def write_ycsb_setenv(home: Path, classpath: Sequence[Path]) -> None:
         return
     joined = ":".join(str(path) for path in classpath)
     setenv.write_text(f'CLASSPATH="$CLASSPATH:{joined}"\n', encoding="utf-8")
+
+
+def register_ycsb_binding(home: Path, name: str, class_name: str) -> None:
+    bindings = home / "bin" / "bindings.properties"
+    line = f"{name}:{class_name}"
+    text = bindings.read_text(encoding="utf-8")
+    if line not in text.splitlines():
+        bindings.write_text(text.rstrip() + "\n" + line + "\n", encoding="utf-8")
+
+
+def ensure_modern_mongo_binding(home: Path) -> list[Path]:
+    driver_jars = download_jars(MODERN_MONGO_DRIVER_JARS)
+    source = REPO_ROOT / "modern_mongo" / "src" / "site" / "ycsb" / "db" / "ModernMongoDbClient.java"
+    build_dir = CACHE_DIR / "modern-mongo" / "classes"
+    jar_file = CACHE_DIR / "modern-mongo" / "modern-mongo-binding.jar"
+    class_file = build_dir / "site" / "ycsb" / "db" / "ModernMongoDbClient.class"
+    core_jar = home / "lib" / f"core-{YCSB_VERSION}.jar"
+
+    if not class_file.exists() or source.stat().st_mtime > class_file.stat().st_mtime:
+        if build_dir.exists():
+            shutil.rmtree(build_dir)
+        build_dir.mkdir(parents=True, exist_ok=True)
+        classpath = ":".join([str(core_jar), *(str(path) for path in driver_jars)])
+        run(["javac", "-cp", classpath, "-d", str(build_dir), str(source)])
+        jar_file.parent.mkdir(parents=True, exist_ok=True)
+        run(["jar", "cf", str(jar_file), "-C", str(build_dir), "."])
+
+    register_ycsb_binding(home, "modern-mongodb", "site.ycsb.db.ModernMongoDbClient")
+    return [jar_file, *driver_jars]
 
 
 def wait_for_port(host: str, port: int, timeout: float = 60.0) -> None:
@@ -506,6 +537,11 @@ def main() -> int:
             uri = args.uri or target.default_uri
             if not uri:
                 raise SystemExit(f"--target {args.target} requires --uri")
+            if target.ycsb_db == "modern-mongodb":
+                classpath = ensure_modern_mongo_binding(home)
+                write_ycsb_setenv(home, classpath)
+            else:
+                write_ycsb_setenv(home, [])
             extra_props.extend([f"mongodb.url={uri}", "mongodb.upsert=true"])
         else:
             jdbc_driver = args.jdbc_driver or target.jdbc_driver
