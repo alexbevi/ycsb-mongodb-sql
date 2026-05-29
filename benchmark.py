@@ -1,0 +1,455 @@
+#!/usr/bin/env python3
+"""Run YCSB benchmarks against smongo and comparable database targets."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import socket
+import sqlite3
+import subprocess
+import sys
+import tarfile
+import time
+import urllib.request
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Sequence
+
+YCSB_VERSION = "0.17.0"
+YCSB_RELEASE = f"https://github.com/brianfrankcooper/YCSB/releases/download/{YCSB_VERSION}"
+
+DEFAULT_RECORD_COUNT = 1000
+DEFAULT_OPERATION_COUNT = 1000
+DEFAULT_WORKLOAD = "workloada"
+DEFAULT_TABLE = "usertable"
+
+REPO_ROOT = Path(__file__).resolve().parent
+CACHE_DIR = REPO_ROOT / ".bench"
+RESULTS_DIR = REPO_ROOT / "results"
+COMPOSE_FILE = REPO_ROOT / "docker-compose.yml"
+
+
+@dataclass(frozen=True)
+class Target:
+    binding: str
+    ycsb_db: str
+    docker_service: str | None = None
+    default_uri: str | None = None
+    jdbc_driver: str | None = None
+    jdbc_url: str | None = None
+    jdbc_user: str = ""
+    jdbc_password: str = ""
+    jdbc_jar: str | None = None
+    starts_smongo: bool = False
+    requires_uri: bool = False
+
+
+TARGETS: dict[str, Target] = {
+    "smongo": Target(
+        binding="mongodb",
+        ycsb_db="mongodb",
+        default_uri="mongodb://127.0.0.1:27018/ycsb?w=1",
+        starts_smongo=True,
+    ),
+    "mongodb": Target(
+        binding="mongodb",
+        ycsb_db="mongodb",
+        docker_service="mongodb",
+        default_uri="mongodb://127.0.0.1:27017/ycsb?w=1",
+    ),
+    "ferretdb": Target(
+        binding="mongodb",
+        ycsb_db="mongodb",
+        docker_service="ferretdb",
+        default_uri=(
+            "mongodb://username:password@127.0.0.1:27019/ycsb"
+            "?authMechanism=PLAIN&w=1"
+        ),
+    ),
+    "documentdb": Target(
+        binding="mongodb",
+        ycsb_db="mongodb",
+        default_uri=os.environ.get("DOCUMENTDB_URI"),
+        requires_uri=True,
+    ),
+    "postgresql": Target(
+        binding="jdbc",
+        ycsb_db="jdbc",
+        docker_service="postgresql",
+        jdbc_driver="org.postgresql.Driver",
+        jdbc_url="jdbc:postgresql://127.0.0.1:5432/ycsb?reWriteBatchedInserts=true",
+        jdbc_user="ycsb",
+        jdbc_password="ycsb",
+        jdbc_jar="https://repo1.maven.org/maven2/org/postgresql/postgresql/42.7.4/postgresql-42.7.4.jar",
+    ),
+    "mysql": Target(
+        binding="jdbc",
+        ycsb_db="jdbc",
+        docker_service="mysql",
+        jdbc_driver="com.mysql.cj.jdbc.Driver",
+        jdbc_url="jdbc:mysql://127.0.0.1:3306/ycsb?rewriteBatchedStatements=true",
+        jdbc_user="ycsb",
+        jdbc_password="ycsb",
+        jdbc_jar="https://repo1.maven.org/maven2/com/mysql/mysql-connector-j/8.4.0/mysql-connector-j-8.4.0.jar",
+    ),
+    "sqlite": Target(
+        binding="jdbc",
+        ycsb_db="jdbc",
+        jdbc_driver="org.sqlite.JDBC",
+        jdbc_jar=(
+            "https://repo1.maven.org/maven2/org/xerial/sqlite-jdbc/3.46.1.0/sqlite-jdbc-3.46.1.0.jar,"
+            "https://repo1.maven.org/maven2/org/slf4j/slf4j-api/2.0.13/slf4j-api-2.0.13.jar,"
+            "https://repo1.maven.org/maven2/org/slf4j/slf4j-simple/2.0.13/slf4j-simple-2.0.13.jar"
+        ),
+    ),
+    "jdbc": Target(binding="jdbc", ycsb_db="jdbc"),
+}
+
+
+def run(cmd: Sequence[str], *, cwd: Path | None = None, check: bool = True, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    printable = " ".join(cmd)
+    print(f"+ {printable}", flush=True)
+    return subprocess.run(cmd, cwd=cwd, check=check, text=True, env=env)
+
+
+def download(url: str, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        return
+    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    print(f"Downloading {url}", flush=True)
+    urllib.request.urlretrieve(url, tmp)
+    tmp.rename(dest)
+
+
+def ycsb_home(binding: str) -> Path:
+    name = f"ycsb-{binding}-binding-{YCSB_VERSION}.tar.gz"
+    archive = CACHE_DIR / "downloads" / name
+    dest = CACHE_DIR / f"ycsb-{binding}-{YCSB_VERSION}"
+    if (dest / "bin" / "ycsb.sh").exists():
+        return dest
+
+    download(f"{YCSB_RELEASE}/{name}", archive)
+    extract_root = CACHE_DIR / "extract" / f"{binding}-{YCSB_VERSION}"
+    if extract_root.exists():
+        shutil.rmtree(extract_root)
+    extract_root.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(archive, "r:gz") as tar:
+        tar.extractall(extract_root)
+
+    candidates = [p for p in extract_root.iterdir() if (p / "bin" / "ycsb.sh").exists()]
+    if not candidates:
+        raise RuntimeError(f"Could not find YCSB executable after extracting {archive}")
+    candidates[0].rename(dest)
+    return dest
+
+
+def download_jar(url_or_path: str) -> Path:
+    if "://" not in url_or_path:
+        return Path(url_or_path).expanduser().resolve()
+    dest = CACHE_DIR / "drivers" / url_or_path.rsplit("/", 1)[1]
+    download(url_or_path, dest)
+    return dest
+
+
+def download_jars(spec: str) -> list[Path]:
+    return [download_jar(item.strip()) for item in spec.split(",") if item.strip()]
+
+
+def write_ycsb_setenv(home: Path, classpath: Sequence[Path]) -> None:
+    setenv = home / "bin" / "setenv.sh"
+    if not classpath:
+        try:
+            setenv.unlink()
+        except FileNotFoundError:
+            pass
+        return
+    joined = ":".join(str(path) for path in classpath)
+    setenv.write_text(f'CLASSPATH="$CLASSPATH:{joined}"\n', encoding="utf-8")
+
+
+def wait_for_port(host: str, port: int, timeout: float = 60.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=1.0):
+                return
+        except OSError:
+            time.sleep(1.0)
+    raise TimeoutError(f"Timed out waiting for {host}:{port}")
+
+
+def docker_compose(*args: str) -> None:
+    run(["docker", "compose", "-f", str(COMPOSE_FILE), *args], cwd=REPO_ROOT)
+
+
+def start_docker_service(service: str) -> None:
+    docker_compose("up", "-d", service)
+
+
+def sql_fields() -> str:
+    fields = ", ".join(f"FIELD{i} TEXT" for i in range(10))
+    return f"YCSB_KEY VARCHAR(255) PRIMARY KEY, {fields}"
+
+
+def reset_sqlite(db_file: Path, table: str) -> None:
+    db_file.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_file) as conn:
+        conn.execute(f"DROP TABLE IF EXISTS {table}")
+        conn.execute(f"CREATE TABLE {table} ({sql_fields()})")
+
+
+def reset_postgresql(table: str) -> None:
+    sql = f"DROP TABLE IF EXISTS {table}; CREATE TABLE {table} ({sql_fields()});"
+    run(["docker", "compose", "-f", str(COMPOSE_FILE), "exec", "-T", "postgresql", "psql", "-U", "ycsb", "-d", "ycsb", "-c", sql], cwd=REPO_ROOT)
+
+
+def reset_mysql(table: str) -> None:
+    fields = ", ".join(f"FIELD{i} TEXT" for i in range(10))
+    sql = f"DROP TABLE IF EXISTS {table}; CREATE TABLE {table} (YCSB_KEY VARCHAR(255) PRIMARY KEY, {fields});"
+    run(["docker", "compose", "-f", str(COMPOSE_FILE), "exec", "-T", "mysql", "mysql", "-uycsb", "-pycsb", "ycsb", "-e", sql], cwd=REPO_ROOT)
+
+
+def write_jdbc_props(path: Path, *, driver: str, url: str, user: str, password: str) -> None:
+    path.write_text(
+        "\n".join(
+            [
+                f"db.driver={driver}",
+                f"db.url={url}",
+                f"db.user={user}",
+                f"db.passwd={password}",
+                "jdbc.autocommit=true",
+                "jdbc.batchupdateapi=true",
+                "db.batchsize=1000",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def smongo_root() -> Path:
+    env_root = os.environ.get("SMONGO_ROOT")
+    if env_root:
+        return Path(env_root).expanduser().resolve()
+    candidate = REPO_ROOT.parents[1]
+    if (candidate / "smongo" / "wire").exists():
+        return candidate
+    return Path.cwd()
+
+
+def smongo_python(root: Path) -> str:
+    env_python = os.environ.get("SMONGO_PYTHON")
+    if env_python:
+        return env_python
+    venv_python = root / ".venv" / "bin" / "python"
+    if venv_python.exists():
+        return str(venv_python)
+    return sys.executable
+
+
+def start_smongo(args: argparse.Namespace, result_dir: Path) -> subprocess.Popen[str]:
+    uri = args.uri or TARGETS["smongo"].default_uri or ""
+    host, port = mongo_host_port(uri)
+    db_path = Path(args.smongo_db_path or result_dir / "smongo-redb").resolve()
+    root = smongo_root()
+    cmd = [
+        smongo_python(root),
+        "-m",
+        "smongo.wire",
+        "--db-path",
+        str(db_path),
+        "--host",
+        host,
+        "--port",
+        str(port),
+    ]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(root) + os.pathsep + env.get("PYTHONPATH", "")
+    log_path = result_dir / "smongo-wire.log"
+    log = log_path.open("w", encoding="utf-8")
+    print(f"+ {' '.join(cmd)} > {log_path}", flush=True)
+    process = subprocess.Popen(cmd, cwd=root, stdout=log, stderr=subprocess.STDOUT, text=True, env=env)
+    try:
+        wait_for_port(host, port, args.timeout)
+    except Exception:
+        process.terminate()
+        raise
+    return process
+
+
+def mongo_host_port(uri: str) -> tuple[str, int]:
+    stripped = uri.split("://", 1)[-1].split("/", 1)[0]
+    if "@" in stripped:
+        stripped = stripped.split("@", 1)[1]
+    host_port = stripped.split(",", 1)[0]
+    if ":" in host_port:
+        host, port = host_port.rsplit(":", 1)
+        return host, int(port)
+    return host_port, 27017
+
+
+def ycsb_command(
+    home: Path,
+    phase: str,
+    target: Target,
+    workload: str,
+    props_file: Path | None,
+    extra_props: list[str],
+    args: argparse.Namespace,
+) -> list[str]:
+    cmd = [
+        str(home / "bin" / "ycsb.sh"),
+        phase,
+        target.ycsb_db,
+        "-s",
+        "-P",
+        str(home / "workloads" / workload),
+        "-p",
+        f"table={args.table}",
+        "-p",
+        f"recordcount={args.record_count}",
+        "-p",
+        f"operationcount={args.operation_count}",
+        "-threads",
+        str(args.threads),
+    ]
+    if props_file is not None:
+        cmd.extend(["-P", str(props_file)])
+    for prop in extra_props:
+        cmd.extend(["-p", prop])
+    return cmd
+
+
+def tee_command(cmd: list[str], output_file: Path) -> None:
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    print(f"+ {' '.join(cmd)} | tee {output_file}", flush=True)
+    hard_error = False
+    error_markers = (
+        "Exception in thread",
+        "NoClassDefFoundError",
+        "ClassNotFoundException",
+        "Unknown option",
+        "[ERROR]",
+    )
+    with output_file.open("w", encoding="utf-8") as out:
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        assert process.stdout is not None
+        for line in process.stdout:
+            if any(marker in line for marker in error_markers):
+                hard_error = True
+            print(line, end="")
+            out.write(line)
+        rc = process.wait()
+    if rc != 0 or hard_error:
+        raise subprocess.CalledProcessError(rc, cmd)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run YCSB benchmarks against smongo and comparable targets.")
+    parser.add_argument("--target", required=True, choices=sorted(TARGETS))
+    parser.add_argument("--action", choices=["prepare", "load", "run", "all"], default="all")
+    parser.add_argument("--workload", default=DEFAULT_WORKLOAD)
+    parser.add_argument("--record-count", type=int, default=DEFAULT_RECORD_COUNT)
+    parser.add_argument("--operation-count", type=int, default=DEFAULT_OPERATION_COUNT)
+    parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument("--table", default=DEFAULT_TABLE)
+    parser.add_argument("--output-dir", type=Path, default=RESULTS_DIR)
+    parser.add_argument("--uri", help="MongoDB-compatible URI for smongo, mongodb, ferretdb, or documentdb")
+    parser.add_argument("--jdbc-driver")
+    parser.add_argument("--jdbc-url")
+    parser.add_argument("--jdbc-user", default="")
+    parser.add_argument("--jdbc-password", default="")
+    parser.add_argument("--jdbc-jar", help="Path or URL to the JDBC driver jar")
+    parser.add_argument("--smongo-db-path")
+    parser.add_argument("--no-docker", action="store_true", help="Do not start Docker services")
+    parser.add_argument("--no-reset", action="store_true", help="Do not reset SQL tables before load")
+    parser.add_argument("--dry-run", action="store_true", help="Print the resolved commands without running YCSB")
+    parser.add_argument("--timeout", type=float, default=60.0)
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    target = TARGETS[args.target]
+    if target.requires_uri and not args.uri and not target.default_uri:
+        raise SystemExit(f"--target {args.target} requires --uri or DOCUMENTDB_URI")
+
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    result_dir = args.output_dir / args.target / stamp
+    result_dir.mkdir(parents=True, exist_ok=True)
+
+    if target.docker_service and not args.no_docker:
+        start_docker_service(target.docker_service)
+
+    smongo_process: subprocess.Popen[str] | None = None
+    if target.starts_smongo:
+        smongo_process = start_smongo(args, result_dir)
+
+    try:
+        home = ycsb_home(target.binding)
+        props_file: Path | None = None
+        classpath: list[Path] = []
+        extra_props: list[str] = []
+
+        if target.binding == "mongodb":
+            uri = args.uri or target.default_uri
+            if not uri:
+                raise SystemExit(f"--target {args.target} requires --uri")
+            extra_props.extend([f"mongodb.url={uri}", "mongodb.upsert=true"])
+        else:
+            jdbc_driver = args.jdbc_driver or target.jdbc_driver
+            jdbc_url = args.jdbc_url or target.jdbc_url
+            jdbc_user = args.jdbc_user or target.jdbc_user
+            jdbc_password = args.jdbc_password or target.jdbc_password
+            jdbc_jar = args.jdbc_jar or target.jdbc_jar
+            if args.target == "sqlite" and not jdbc_url:
+                sqlite_file = (result_dir / "sqlite" / "ycsb.sqlite").resolve()
+                jdbc_url = f"jdbc:sqlite:{sqlite_file}"
+            if not jdbc_driver or not jdbc_url or not jdbc_jar:
+                raise SystemExit("JDBC targets require --jdbc-driver, --jdbc-url, and --jdbc-jar")
+            classpath = download_jars(jdbc_jar)
+            write_ycsb_setenv(home, classpath)
+            props_file = result_dir / "jdbc.properties"
+            write_jdbc_props(props_file, driver=jdbc_driver, url=jdbc_url, user=jdbc_user, password=jdbc_password)
+
+            if not args.no_reset and args.action in {"prepare", "load", "all"}:
+                if args.target == "sqlite":
+                    reset_sqlite(Path(jdbc_url.removeprefix("jdbc:sqlite:")), args.table)
+                elif args.target == "postgresql" and not args.no_docker:
+                    reset_postgresql(args.table)
+                elif args.target == "mysql" and not args.no_docker:
+                    reset_mysql(args.table)
+
+        phases = []
+        if args.action == "prepare":
+            phases = []
+        elif args.action == "all":
+            phases = ["load", "run"]
+        else:
+            phases = [args.action]
+
+        for phase in phases:
+            cmd = ycsb_command(home, phase, target, args.workload, props_file, extra_props, args)
+            output_file = result_dir / f"{phase}.txt"
+            if args.dry_run:
+                print(" ".join(cmd))
+            else:
+                tee_command(cmd, output_file)
+
+        print(f"Results: {result_dir}")
+        return 0
+    finally:
+        if smongo_process is not None:
+            smongo_process.terminate()
+            try:
+                smongo_process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                smongo_process.kill()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

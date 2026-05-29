@@ -1,0 +1,58 @@
+services:
+  mongodb:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    command: ["mongod", "--bind_ip_all"]
+
+  postgresql:
+    image: postgres:16
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: ycsb
+      POSTGRES_USER: ycsb
+      POSTGRES_PASSWORD: ycsb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ycsb -d ycsb"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  mysql:
+    image: mysql:8
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_DATABASE: ycsb
+      MYSQL_USER: ycsb
+      MYSQL_PASSWORD: ycsb
+      MYSQL_ROOT_PASSWORD: root
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uycsb", "-pycsb"]
+      interval: 2s
+      timeout: 5s
+      retries: 40
+
+  ferretdb-postgres:
+    image: ghcr.io/ferretdb/postgres-documentdb:17-0.107.0-ferretdb-2.7.0
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: username
+      POSTGRES_PASSWORD: password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U username -d postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  ferretdb:
+    image: ghcr.io/ferretdb/ferretdb:2.7.0
+    ports:
+      - "27019:27017"
+    environment:
+      FERRETDB_POSTGRESQL_URL: postgres://username:password@ferretdb-postgres:5432/postgres
+    depends_on:
+      ferretdb-postgres:
+        condition: service_healthy
+
