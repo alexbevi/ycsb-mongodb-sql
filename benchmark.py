@@ -37,6 +37,8 @@ class Target:
     binding: str
     ycsb_db: str
     docker_service: str | None = None
+    wait_host: str | None = None
+    wait_port: int | None = None
     default_uri: str | None = None
     jdbc_driver: str | None = None
     jdbc_url: str | None = None
@@ -58,12 +60,16 @@ TARGETS: dict[str, Target] = {
         binding="mongodb",
         ycsb_db="mongodb",
         docker_service="mongodb",
+        wait_host="127.0.0.1",
+        wait_port=27017,
         default_uri="mongodb://127.0.0.1:27017/ycsb?w=1",
     ),
     "ferretdb": Target(
         binding="mongodb",
         ycsb_db="mongodb",
         docker_service="ferretdb",
+        wait_host="127.0.0.1",
+        wait_port=27019,
         default_uri=(
             "mongodb://username:password@127.0.0.1:27019/ycsb"
             "?authMechanism=PLAIN&w=1"
@@ -79,6 +85,8 @@ TARGETS: dict[str, Target] = {
         binding="jdbc",
         ycsb_db="jdbc",
         docker_service="postgresql",
+        wait_host="127.0.0.1",
+        wait_port=5432,
         jdbc_driver="org.postgresql.Driver",
         jdbc_url="jdbc:postgresql://127.0.0.1:5432/ycsb?reWriteBatchedInserts=true",
         jdbc_user="ycsb",
@@ -89,6 +97,8 @@ TARGETS: dict[str, Target] = {
         binding="jdbc",
         ycsb_db="jdbc",
         docker_service="mysql",
+        wait_host="127.0.0.1",
+        wait_port=3306,
         jdbc_driver="com.mysql.cj.jdbc.Driver",
         jdbc_url="jdbc:mysql://127.0.0.1:3306/ycsb?rewriteBatchedStatements=true",
         jdbc_user="ycsb",
@@ -109,10 +119,17 @@ TARGETS: dict[str, Target] = {
 }
 
 
-def run(cmd: Sequence[str], *, cwd: Path | None = None, check: bool = True, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+def run(
+    cmd: Sequence[str],
+    *,
+    cwd: Path | None = None,
+    check: bool = True,
+    env: dict[str, str] | None = None,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess[str]:
     printable = " ".join(cmd)
     print(f"+ {printable}", flush=True)
-    return subprocess.run(cmd, cwd=cwd, check=check, text=True, env=env)
+    return subprocess.run(cmd, cwd=cwd, check=check, text=True, env=env, timeout=timeout)
 
 
 def download(url: str, dest: Path) -> None:
@@ -138,7 +155,7 @@ def ycsb_home(binding: str) -> Path:
         shutil.rmtree(extract_root)
     extract_root.mkdir(parents=True, exist_ok=True)
     with tarfile.open(archive, "r:gz") as tar:
-        tar.extractall(extract_root)
+        tar.extractall(extract_root, filter="data")
 
     candidates = [p for p in extract_root.iterdir() if (p / "bin" / "ycsb.sh").exists()]
     if not candidates:
@@ -182,12 +199,22 @@ def wait_for_port(host: str, port: int, timeout: float = 60.0) -> None:
     raise TimeoutError(f"Timed out waiting for {host}:{port}")
 
 
-def docker_compose(*args: str) -> None:
-    run(["docker", "compose", "-f", str(COMPOSE_FILE), *args], cwd=REPO_ROOT)
+def docker_compose(*args: str, timeout: float | None = None) -> None:
+    run(["docker", "compose", "-f", str(COMPOSE_FILE), *args], cwd=REPO_ROOT, timeout=timeout)
 
 
-def start_docker_service(service: str) -> None:
-    docker_compose("up", "-d", service)
+def start_docker_service(target: Target, timeout: float, startup_timeout: float) -> None:
+    if target.docker_service is None:
+        return
+    try:
+        docker_compose("up", "-d", target.docker_service, timeout=startup_timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"timed out after {startup_timeout:g}s starting Docker service "
+            f"{target.docker_service}; check Docker image pulls and registry access"
+        ) from exc
+    if target.wait_host is not None and target.wait_port is not None:
+        wait_for_port(target.wait_host, target.wait_port, timeout)
 
 
 def sql_fields() -> str:
@@ -344,7 +371,9 @@ def tee_command(cmd: list[str], output_file: Path) -> None:
             print(line, end="")
             out.write(line)
         rc = process.wait()
-    if rc != 0 or hard_error:
+    if hard_error:
+        raise RuntimeError(f"YCSB output contained an error marker; see {output_file}")
+    if rc != 0:
         raise subprocess.CalledProcessError(rc, cmd)
 
 
@@ -369,6 +398,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-reset", action="store_true", help="Do not reset SQL tables before load")
     parser.add_argument("--dry-run", action="store_true", help="Print the resolved commands without running YCSB")
     parser.add_argument("--timeout", type=float, default=60.0)
+    parser.add_argument(
+        "--docker-start-timeout",
+        type=float,
+        default=600.0,
+        help="Maximum seconds to allow docker compose startup, including image pulls",
+    )
     return parser.parse_args()
 
 
@@ -383,7 +418,7 @@ def main() -> int:
     result_dir.mkdir(parents=True, exist_ok=True)
 
     if target.docker_service and not args.no_docker:
-        start_docker_service(target.docker_service)
+        start_docker_service(target, args.timeout, args.docker_start_timeout)
 
     smongo_process: subprocess.Popen[str] | None = None
     if target.starts_smongo:
@@ -452,4 +487,14 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except subprocess.CalledProcessError as exc:
+        print(f"error: command failed with exit code {exc.returncode}: {' '.join(exc.cmd)}", file=sys.stderr)
+        raise SystemExit(exc.returncode or 1)
+    except subprocess.TimeoutExpired as exc:
+        print(f"error: command timed out after {exc.timeout:g}s: {' '.join(exc.cmd)}", file=sys.stderr)
+        raise SystemExit(1)
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(1)

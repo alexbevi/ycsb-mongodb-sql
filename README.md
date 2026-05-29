@@ -45,4 +45,5 @@ python benchmark.py --target jdbc --jdbc-driver org.postgresql.Driver \
 
 Docker-backed targets start their service with `docker compose up -d <service>`.
 Use `--no-docker` when you already have the target running.
-
+If Docker image pulls are slow, raise `--docker-start-timeout`; the default is
+600 seconds.

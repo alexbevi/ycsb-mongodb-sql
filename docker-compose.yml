@@ -6,7 +6,7 @@ services:
     command: ["mongod", "--bind_ip_all"]
 
   postgresql:
-    image: postgres:16
+    image: postgres:16-alpine
     ports:
       - "5432:5432"
     environment:
@@ -55,4 +55,3 @@ services:
     depends_on:
       ferretdb-postgres:
         condition: service_healthy
-
