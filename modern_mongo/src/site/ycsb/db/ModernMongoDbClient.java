@@ -1,6 +1,7 @@
 package site.ycsb.db;
 
 import com.mongodb.ConnectionString;
+import com.mongodb.MongoClientSettings;
 import com.mongodb.client.FindIterable;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
@@ -10,10 +11,18 @@ import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.ReplaceOptions;
 import com.mongodb.client.result.DeleteResult;
 import com.mongodb.client.result.UpdateResult;
+import java.security.GeneralSecurityException;
+import java.security.SecureRandom;
+import java.security.cert.X509Certificate;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.Vector;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
 import org.bson.Document;
 import org.bson.types.Binary;
 import site.ycsb.ByteArrayByteIterator;
@@ -35,8 +44,13 @@ public class ModernMongoDbClient extends DB {
     String url = getProperties().getProperty("mongodb.url", DEFAULT_URL);
     upsert = Boolean.parseBoolean(getProperties().getProperty("mongodb.upsert", "false"));
     try {
-      ConnectionString connectionString = new ConnectionString(url);
-      client = MongoClients.create(connectionString);
+      ConnectionString connectionString = new ConnectionString(stripUnsupportedTlsOptions(url));
+      MongoClientSettings.Builder settings = MongoClientSettings.builder().applyConnectionString(connectionString);
+      if (tlsAllowsInvalidCertificates(url)) {
+        settings.applyToSslSettings(
+            builder -> builder.context(insecureSslContext()).invalidHostNameAllowed(true));
+      }
+      client = MongoClients.create(settings.build());
       String databaseName = connectionString.getDatabase();
       if (databaseName == null || databaseName.isEmpty() || "admin".equals(databaseName)) {
         databaseName = "ycsb";
@@ -187,6 +201,69 @@ public class ModernMongoDbClient extends DB {
       } else if (value != null) {
         result.put(key, new StringByteIterator(value.toString()));
       }
+    }
+  }
+
+  private static boolean tlsAllowsInvalidCertificates(String url) {
+    for (String param : queryParams(url)) {
+      String[] parts = param.split("=", 2);
+      String key = parts[0].toLowerCase();
+      String value = parts.length == 1 ? "true" : parts[1].toLowerCase();
+      if (("tlsallowinvalidcertificates".equals(key) || "tlsinsecure".equals(key))
+          && ("true".equals(value) || "1".equals(value))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static String stripUnsupportedTlsOptions(String url) {
+    int queryStart = url.indexOf('?');
+    if (queryStart < 0) {
+      return url;
+    }
+    String base = url.substring(0, queryStart);
+    List<String> supported = new ArrayList<>();
+    for (String param : queryParams(url)) {
+      String key = param.split("=", 2)[0].toLowerCase();
+      if (!"tlsallowinvalidcertificates".equals(key) && !"tlsinsecure".equals(key)) {
+        supported.add(param);
+      }
+    }
+    if (supported.isEmpty()) {
+      return base;
+    }
+    return base + "?" + String.join("&", supported);
+  }
+
+  private static String[] queryParams(String url) {
+    int queryStart = url.indexOf('?');
+    if (queryStart < 0 || queryStart + 1 >= url.length()) {
+      return new String[0];
+    }
+    return url.substring(queryStart + 1).split("&");
+  }
+
+  private static SSLContext insecureSslContext() {
+    try {
+      SSLContext context = SSLContext.getInstance("TLS");
+      context.init(null, new TrustManager[] {new TrustAllManager()}, new SecureRandom());
+      return context;
+    } catch (GeneralSecurityException exc) {
+      throw new IllegalStateException("Could not initialize insecure SSL context", exc);
+    }
+  }
+
+  private static final class TrustAllManager implements X509TrustManager {
+    @Override
+    public void checkClientTrusted(X509Certificate[] chain, String authType) {}
+
+    @Override
+    public void checkServerTrusted(X509Certificate[] chain, String authType) {}
+
+    @Override
+    public X509Certificate[] getAcceptedIssuers() {
+      return new X509Certificate[0];
     }
   }
 }

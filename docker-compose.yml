@@ -55,3 +55,9 @@ services:
     depends_on:
       ferretdb-postgres:
         condition: service_healthy
+
+  documentdb:
+    image: ghcr.io/documentdb/documentdb/documentdb-local:latest
+    ports:
+      - "10260:10260"
+    command: ["--username", "username", "--password", "password"]

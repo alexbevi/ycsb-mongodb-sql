@@ -81,8 +81,14 @@ TARGETS: dict[str, Target] = {
     "documentdb": Target(
         binding="mongodb",
         ycsb_db="modern-mongodb",
-        default_uri=os.environ.get("DOCUMENTDB_URI"),
-        requires_uri=True,
+        docker_service="documentdb",
+        wait_host="127.0.0.1",
+        wait_port=10260,
+        default_uri=os.environ.get(
+            "DOCUMENTDB_URI",
+            "mongodb://username:password@127.0.0.1:10260/ycsb"
+            "?authSource=admin&tls=true&tlsAllowInvalidCertificates=true&directConnection=true&w=1",
+        ),
     ),
     "postgresql": Target(
         binding="jdbc",

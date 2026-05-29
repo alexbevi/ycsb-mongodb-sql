@@ -6,7 +6,7 @@ so the same workload can run against:
 - `smongo` through the smongo MongoDB wire server
 - `mongodb` through a Docker MongoDB instance
 - `ferretdb` through a Docker FerretDB instance
-- `documentdb` through a supplied MongoDB-compatible URI
+- `documentdb` through the local DocumentDB Docker image from documentdb.io
 - `postgresql` and `mysql` through Docker JDBC targets
 - `sqlite` through the YCSB JDBC binding
 - `jdbc` through a supplied JDBC driver, URL, and driver jar
@@ -43,22 +43,22 @@ Results are written under `results/<target>/<timestamp>/`.
 python benchmark.py --target smongo --workload workloada --threads 4
 python benchmark.py --target mongodb --uri 'mongodb://127.0.0.1:27017/ycsb?w=1'
 python benchmark.py --target ferretdb --uri 'mongodb://username:password@127.0.0.1:27019/ycsb?w=1'
+python benchmark.py --target documentdb
 python benchmark.py --target documentdb --uri "$DOCUMENTDB_URI"
-python benchmark.py --target documentdb --uri "$DOCUMENTDB_URI" \
-  --java-opt=-Djavax.net.ssl.trustStore=/path/to/documentdb-truststore.jks \
-  --java-opt=-Djavax.net.ssl.trustStorePassword=changeit
 python benchmark.py --target jdbc --jdbc-driver org.postgresql.Driver \
   --jdbc-url 'jdbc:postgresql://127.0.0.1:5432/ycsb' \
   --jdbc-user ycsb --jdbc-password ycsb --jdbc-jar ./postgresql.jar
 ```
 
-`documentdb` is a user-supplied MongoDB-compatible endpoint. Set
-`DOCUMENTDB_URI` or pass `--uri`; for AWS DocumentDB, include whatever TLS,
-CA bundle, replica set, read preference, and `retryWrites=false` options your
-cluster requires. The target uses the modern MongoDB binding rather than the
-stock YCSB MongoDB binding so newer MongoDB-compatible servers do not have to
-support legacy `OP_QUERY` handshakes.
-Use repeated `--java-opt` values for JVM TLS settings such as a Java truststore.
+`documentdb` starts `ghcr.io/documentdb/documentdb/documentdb-local:latest`,
+publishes port `10260`, and connects with the local image's self-signed TLS
+certificate accepted via `tlsAllowInvalidCertificates=true`. Use `--uri` or
+`DOCUMENTDB_URI` to point at an already running DocumentDB endpoint instead.
+The target uses the modern MongoDB binding rather than the stock YCSB MongoDB
+binding so newer MongoDB-compatible servers do not have to support legacy
+`OP_QUERY` handshakes.
+Use repeated `--java-opt` values if your endpoint needs JVM TLS settings such
+as a Java truststore.
 
 The generic `jdbc` target is for SQL engines beyond the built-in `sqlite`,
 `postgresql`, and `mysql` targets. Supply the JDBC driver class, URL, user,
