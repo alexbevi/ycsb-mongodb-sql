@@ -60,6 +60,9 @@ python benchmark.py --target documentdb --compare-to mysql \
 
 python benchmark.py --target ferretdb --compare-to mongodb \
   --record-count 1000 --operation-count 1000
+
+python benchmark.py --target mongodb --compare-to mongodb \
+  --record-count 1000 --operation-count 1000
 ```
 
 Comparison results are written under:
@@ -77,6 +80,9 @@ results/compare-<left>-<right>/<timestamp>/<left>/run.txt
 results/compare-<left>-<right>/<timestamp>/<right>/load.txt
 results/compare-<left>-<right>/<timestamp>/<right>/run.txt
 ```
+
+When both sides use the same target, the raw output directories are suffixed
+with `-left` and `-right`, for example `mongodb-left/` and `mongodb-right/`.
 
 Use the `postgresql` target name for Postgres.
 

@@ -586,22 +586,36 @@ def comparison_rows(phase: str) -> list[tuple[str, Sequence[str], bool]]:
     ]
 
 
-def write_comparison_table(result_dir: Path, left_name: str, right_name: str, phases: Sequence[str]) -> Path:
+def write_comparison_table(
+    result_dir: Path,
+    left_name: str,
+    right_name: str,
+    phases: Sequence[str],
+    *,
+    left_dir_name: str | None = None,
+    right_dir_name: str | None = None,
+    left_column_name: str | None = None,
+    right_column_name: str | None = None,
+) -> Path:
     path = result_dir / "comparison.md"
+    left_dir = left_dir_name or left_name
+    right_dir = right_dir_name or right_name
+    left_column = left_column_name or left_name
+    right_column = right_column_name or right_name
     lines = [
         f"# {left_name} vs {right_name}",
         "",
     ]
     for phase in phases:
-        left_metrics = parse_ycsb_metrics(result_dir / left_name / f"{phase}.txt")
-        right_metrics = parse_ycsb_metrics(result_dir / right_name / f"{phase}.txt")
+        left_metrics = parse_ycsb_metrics(result_dir / left_dir / f"{phase}.txt")
+        right_metrics = parse_ycsb_metrics(result_dir / right_dir / f"{phase}.txt")
         if not left_metrics and not right_metrics:
             continue
         lines.extend(
             [
                 f"## {phase}",
                 "",
-                f"| Metric | {left_name} | {right_name} |",
+                f"| Metric | {left_column} | {right_column} |",
                 "| --- | ---: | ---: |",
             ]
         )
@@ -762,17 +776,34 @@ def benchmark_args(args: argparse.Namespace, target_name: str) -> argparse.Names
 
 
 def compare_targets(args: argparse.Namespace, left_name: str, right_name: str) -> None:
-    if left_name == right_name:
-        raise SystemExit("comparison targets must be different")
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     result_dir = args.output_dir / f"compare-{left_name}-{right_name}" / stamp
+    if left_name == right_name:
+        left_dir = f"{left_name}-left"
+        right_dir = f"{right_name}-right"
+        left_label = f"{left_name} #1"
+        right_label = f"{right_name} #2"
+    else:
+        left_dir = left_name
+        right_dir = right_name
+        left_label = left_name
+        right_label = right_name
 
     left_args = benchmark_args(args, left_name)
     right_args = benchmark_args(args, right_name)
 
-    phases = run_benchmark(left_args, result_dir / left_name)
-    run_benchmark(right_args, result_dir / right_name)
-    comparison = write_comparison_table(result_dir, left_name, right_name, phases)
+    phases = run_benchmark(left_args, result_dir / left_dir)
+    run_benchmark(right_args, result_dir / right_dir)
+    comparison = write_comparison_table(
+        result_dir,
+        left_name,
+        right_name,
+        phases,
+        left_dir_name=left_dir,
+        right_dir_name=right_dir,
+        left_column_name=left_label,
+        right_column_name=right_label,
+    )
     print(comparison.read_text(encoding="utf-8"))
     print(f"Comparison: {comparison}")
 
