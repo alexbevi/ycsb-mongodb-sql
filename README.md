@@ -64,11 +64,14 @@ The generic `jdbc` target is for SQL engines beyond the built-in `sqlite`,
 `postgresql`, and `mysql` targets. Supply the JDBC driver class, URL, user,
 password, and one or more comma-separated local paths or URLs in `--jdbc-jar`.
 The built-in SQL targets create/reset the YCSB table automatically; generic
-JDBC targets expect the table schema to already exist unless your target driver
-or database creates it separately.
+JDBC targets write `schema.sql` next to `jdbc.properties` in the result
+directory so you can initialize the table with the target database's own SQL
+client before running `load`/`run`.
 
 Docker-backed targets start their service with `docker compose up -d <service>`.
 Use `--no-docker` when you already have the target running.
+`--dry-run` prints the resolved YCSB command without starting services, resetting
+SQL tables, or running YCSB.
 If Docker image pulls are slow, raise `--docker-start-timeout`; the default is
 600 seconds.
 When `DOCKER_CONFIG` is unset, the harness uses `.bench/docker-config` with

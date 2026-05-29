@@ -324,6 +324,14 @@ def sql_fields() -> str:
     return f"YCSB_KEY VARCHAR(255) PRIMARY KEY, {fields}"
 
 
+def sql_schema(table: str) -> str:
+    return f"DROP TABLE IF EXISTS {table};\nCREATE TABLE {table} ({sql_fields()});\n"
+
+
+def write_sql_schema(path: Path, table: str) -> None:
+    path.write_text(sql_schema(table), encoding="utf-8")
+
+
 def reset_sqlite(db_file: Path, table: str) -> None:
     db_file.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(db_file) as conn:
@@ -332,19 +340,45 @@ def reset_sqlite(db_file: Path, table: str) -> None:
 
 
 def reset_postgresql(table: str) -> None:
-    sql = f"DROP TABLE IF EXISTS {table}; CREATE TABLE {table} ({sql_fields()});"
     run(
-        ["docker", "compose", "-f", str(COMPOSE_FILE), "exec", "-T", "postgresql", "psql", "-U", "ycsb", "-d", "ycsb", "-c", sql],
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(COMPOSE_FILE),
+            "exec",
+            "-T",
+            "postgresql",
+            "psql",
+            "-U",
+            "ycsb",
+            "-d",
+            "ycsb",
+            "-c",
+            sql_schema(table),
+        ],
         cwd=REPO_ROOT,
         env=docker_env(),
     )
 
 
 def reset_mysql(table: str) -> None:
-    fields = ", ".join(f"FIELD{i} TEXT" for i in range(10))
-    sql = f"DROP TABLE IF EXISTS {table}; CREATE TABLE {table} (YCSB_KEY VARCHAR(255) PRIMARY KEY, {fields});"
     run(
-        ["docker", "compose", "-f", str(COMPOSE_FILE), "exec", "-T", "mysql", "mysql", "-uycsb", "-pycsb", "ycsb", "-e", sql],
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(COMPOSE_FILE),
+            "exec",
+            "-T",
+            "mysql",
+            "mysql",
+            "-uycsb",
+            "-pycsb",
+            "ycsb",
+            "-e",
+            sql_schema(table),
+        ],
         cwd=REPO_ROOT,
         env=docker_env(),
     )
@@ -537,11 +571,11 @@ def main() -> int:
     result_dir = args.output_dir / args.target / stamp
     result_dir.mkdir(parents=True, exist_ok=True)
 
-    if target.docker_service and not args.no_docker:
+    if target.docker_service and not args.no_docker and not args.dry_run:
         start_docker_service(target, args.timeout, args.docker_start_timeout)
 
     smongo_process: subprocess.Popen[str] | None = None
-    if target.starts_smongo:
+    if target.starts_smongo and not args.dry_run:
         smongo_process = start_smongo(args, result_dir)
 
     try:
@@ -575,8 +609,11 @@ def main() -> int:
             write_ycsb_setenv(home, classpath, args.java_opt)
             props_file = result_dir / "jdbc.properties"
             write_jdbc_props(props_file, driver=jdbc_driver, url=jdbc_url, user=jdbc_user, password=jdbc_password)
+            write_sql_schema(result_dir / "schema.sql", args.table)
+            if args.target == "jdbc":
+                print(f"Generic JDBC schema: {result_dir / 'schema.sql'}")
 
-            if not args.no_reset and args.action in {"prepare", "load", "all"}:
+            if not args.no_reset and not args.dry_run and args.action in {"prepare", "load", "all"}:
                 if args.target == "sqlite":
                     reset_sqlite(Path(jdbc_url.removeprefix("jdbc:sqlite:")), args.table)
                 elif args.target == "postgresql" and not args.no_docker:
