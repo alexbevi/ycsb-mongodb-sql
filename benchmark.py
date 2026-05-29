@@ -424,9 +424,13 @@ def tee_command(cmd: list[str], output_file: Path) -> None:
     print(f"+ {' '.join(cmd)} | tee {output_file}", flush=True)
     hard_error = False
     error_markers = (
+        "-FAILED]",
         "Exception in thread",
+        "Exception while",
         "NoClassDefFoundError",
         "ClassNotFoundException",
+        "MongoTimeoutException",
+        "Return=ERROR",
         "Unknown option",
         "[ERROR]",
     )
