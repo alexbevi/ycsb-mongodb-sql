@@ -31,6 +31,7 @@ tools/smongo-bench --target ferretdb --record-count 1000 --operation-count 1000
 tools/smongo-bench --target postgresql --record-count 1000 --operation-count 1000
 tools/smongo-bench --target mysql --record-count 1000 --operation-count 1000
 tools/smongo-bench --target sqlite --record-count 1000 --operation-count 1000
+tools/smongo-bench --target sqlite --compare-smongo --record-count 1000 --operation-count 1000
 ```
 
 From this submodule directly:
@@ -41,6 +42,8 @@ python benchmark.py --target sqlite --record-count 1000 --operation-count 1000
 
 The default action is `all`, which runs YCSB `load` followed by `run`.
 Results are written under `results/<target>/<timestamp>/`.
+Use `--compare-smongo` with any non-`smongo` target to run both sides and write
+`results/compare-smongo-<target>/<timestamp>/comparison.md`.
 
 ## Common options
 
@@ -77,6 +80,9 @@ Docker-backed targets start their service with `docker compose up -d <service>`.
 Use `--no-docker` when you already have the target running.
 `--dry-run` prints the resolved YCSB command without starting services, resetting
 SQL tables, or running YCSB.
+`--compare-smongo` writes a Markdown table with `smongo` in one column and the
+selected target in the other, covering load and run throughput plus key latency
+metrics.
 If Docker image pulls are slow, raise `--docker-start-timeout`; the default is
 600 seconds.
 When `DOCKER_CONFIG` is unset, the harness uses `.bench/docker-config` with

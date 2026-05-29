@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import os
 import shlex
 import shutil
@@ -531,6 +532,96 @@ def tee_command(cmd: list[str], output_file: Path) -> None:
         raise subprocess.CalledProcessError(rc, cmd)
 
 
+def parse_ycsb_metrics(path: Path) -> dict[str, str]:
+    metrics: dict[str, str] = {}
+    if not path.exists():
+        return metrics
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.startswith("["):
+            continue
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) != 3:
+            continue
+        section = parts[0].strip("[]")
+        metrics[f"{section}.{parts[1]}"] = parts[2]
+    return metrics
+
+
+def metric_value(metrics: dict[str, str], keys: Sequence[str]) -> str:
+    for key in keys:
+        if key in metrics:
+            return metrics[key]
+    return ""
+
+
+def format_metric(value: str, *, integer: bool = False) -> str:
+    if not value:
+        return "-"
+    try:
+        number = float(value)
+    except ValueError:
+        return value
+    if integer:
+        return str(int(number))
+    return f"{number:,.2f}"
+
+
+def comparison_rows(phase: str) -> list[tuple[str, Sequence[str], bool]]:
+    if phase == "load":
+        return [
+            ("Throughput ops/sec", ("OVERALL.Throughput(ops/sec)",), False),
+            ("Insert operations", ("INSERT.Operations",), True),
+            ("Insert avg latency us", ("INSERT.AverageLatency(us)",), False),
+            ("Insert p95 latency us", ("INSERT.95thPercentileLatency(us)",), False),
+            ("Insert p99 latency us", ("INSERT.99thPercentileLatency(us)",), False),
+        ]
+    return [
+        ("Throughput ops/sec", ("OVERALL.Throughput(ops/sec)",), False),
+        ("Read operations", ("READ.Operations",), True),
+        ("Read avg latency us", ("READ.AverageLatency(us)",), False),
+        ("Read p95 latency us", ("READ.95thPercentileLatency(us)",), False),
+        ("Update operations", ("UPDATE.Operations",), True),
+        ("Update avg latency us", ("UPDATE.AverageLatency(us)",), False),
+        ("Update p95 latency us", ("UPDATE.95thPercentileLatency(us)",), False),
+    ]
+
+
+def write_comparison_table(result_dir: Path, target_name: str, phases: Sequence[str]) -> Path:
+    path = result_dir / "comparison.md"
+    lines = [
+        f"# smongo vs {target_name}",
+        "",
+    ]
+    for phase in phases:
+        smongo_metrics = parse_ycsb_metrics(result_dir / "smongo" / f"{phase}.txt")
+        target_metrics = parse_ycsb_metrics(result_dir / target_name / f"{phase}.txt")
+        if not smongo_metrics and not target_metrics:
+            continue
+        lines.extend(
+            [
+                f"## {phase}",
+                "",
+                f"| Metric | smongo | {target_name} |",
+                "| --- | ---: | ---: |",
+            ]
+        )
+        for label, keys, integer in comparison_rows(phase):
+            smongo_value = format_metric(metric_value(smongo_metrics, keys), integer=integer)
+            target_value = format_metric(metric_value(target_metrics, keys), integer=integer)
+            lines.append(f"| {label} | {smongo_value} | {target_value} |")
+        lines.append("")
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
+def resolved_phases(action: str) -> list[str]:
+    if action == "prepare":
+        return []
+    if action == "all":
+        return ["load", "run"]
+    return [action]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run YCSB benchmarks against smongo and comparable targets.")
     parser.add_argument("--target", required=True, choices=sorted(TARGETS))
@@ -557,6 +648,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-docker", action="store_true", help="Do not start Docker services")
     parser.add_argument("--no-reset", action="store_true", help="Do not reset SQL tables before load")
     parser.add_argument("--dry-run", action="store_true", help="Print the resolved commands without running YCSB")
+    parser.add_argument(
+        "--compare-smongo",
+        action="store_true",
+        help="Run smongo and the selected target, then write a side-by-side comparison table",
+    )
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument(
         "--docker-start-timeout",
@@ -567,14 +663,11 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> int:
-    args = parse_args()
+def run_benchmark(args: argparse.Namespace, result_dir: Path) -> list[str]:
     target = TARGETS[args.target]
     if target.requires_uri and not args.uri and not target.default_uri:
         raise SystemExit(f"--target {args.target} requires --uri or DOCUMENTDB_URI")
 
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    result_dir = args.output_dir / args.target / stamp
     result_dir.mkdir(parents=True, exist_ok=True)
 
     if target.docker_service and not args.no_docker and not args.dry_run:
@@ -627,13 +720,7 @@ def main() -> int:
                 elif args.target == "mysql" and not args.no_docker:
                     reset_mysql(args.table)
 
-        phases = []
-        if args.action == "prepare":
-            phases = []
-        elif args.action == "all":
-            phases = ["load", "run"]
-        else:
-            phases = [args.action]
+        phases = resolved_phases(args.action)
 
         for phase in phases:
             cmd = ycsb_command(home, phase, target, args.workload, props_file, extra_props, args)
@@ -644,7 +731,7 @@ def main() -> int:
                 tee_command(cmd, output_file)
 
         print(f"Results: {result_dir}")
-        return 0
+        return phases
     finally:
         if smongo_process is not None:
             smongo_process.terminate()
@@ -652,6 +739,37 @@ def main() -> int:
                 smongo_process.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 smongo_process.kill()
+
+
+def compare_smongo(args: argparse.Namespace) -> None:
+    if args.target == "smongo":
+        raise SystemExit("--compare-smongo requires a target other than smongo")
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    result_dir = args.output_dir / f"compare-smongo-{args.target}" / stamp
+
+    smongo_args = copy.copy(args)
+    smongo_args.target = "smongo"
+    smongo_args.uri = None
+    smongo_args.no_docker = True
+
+    target_args = copy.copy(args)
+    target_args.compare_smongo = False
+
+    phases = run_benchmark(smongo_args, result_dir / "smongo")
+    run_benchmark(target_args, result_dir / args.target)
+    comparison = write_comparison_table(result_dir, args.target, phases)
+    print(comparison.read_text(encoding="utf-8"))
+    print(f"Comparison: {comparison}")
+
+
+def main() -> int:
+    args = parse_args()
+    if args.compare_smongo:
+        compare_smongo(args)
+    else:
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        run_benchmark(args, args.output_dir / args.target / stamp)
+    return 0
 
 
 if __name__ == "__main__":
