@@ -11,9 +11,14 @@ so the same workload can run against:
 - `sqlite` through the YCSB JDBC binding
 - `jdbc` through a supplied JDBC driver, URL, and driver jar
 
-YCSB is downloaded into `.bench/` on first use and is not checked in. Docker
-targets use `docker compose`; `ferretdb` and `documentdb` also compile a small
-modern MongoDB binding, so they require `javac` on `PATH`.
+YCSB is downloaded into `.bench/` on first use and is not checked in. The
+version comes from `YCSB_VERSION` in `benchmark.py`; it is currently `0.17.0`
+because that is the latest GitHub release published by upstream YCSB. When
+upstream publishes a newer release artifact, update `YCSB_VERSION`, clear
+`.bench/`, and rerun the target smoke tests.
+
+Docker targets use `docker compose`; `ferretdb` and `documentdb` also compile a
+small modern MongoDB binding, so they require `javac` on `PATH`.
 
 ## Quick start
 
