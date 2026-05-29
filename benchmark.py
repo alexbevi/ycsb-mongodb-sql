@@ -132,6 +132,22 @@ def run(
     return subprocess.run(cmd, cwd=cwd, check=check, text=True, env=env, timeout=timeout)
 
 
+def docker_env() -> dict[str, str]:
+    env = os.environ.copy()
+    if "DOCKER_CONFIG" not in env:
+        original_plugin_dir = Path.home() / ".docker" / "cli-plugins"
+        config_dir = CACHE_DIR / "docker-config"
+        config_file = config_dir / "config.json"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        if not config_file.exists():
+            config_file.write_text('{"auths":{}}\n', encoding="utf-8")
+        plugin_link = config_dir / "cli-plugins"
+        if original_plugin_dir.exists() and not plugin_link.exists():
+            plugin_link.symlink_to(original_plugin_dir, target_is_directory=True)
+        env["DOCKER_CONFIG"] = str(config_dir)
+    return env
+
+
 def download(url: str, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():
@@ -200,7 +216,50 @@ def wait_for_port(host: str, port: int, timeout: float = 60.0) -> None:
 
 
 def docker_compose(*args: str, timeout: float | None = None) -> None:
-    run(["docker", "compose", "-f", str(COMPOSE_FILE), *args], cwd=REPO_ROOT, timeout=timeout)
+    run(
+        ["docker", "compose", "-f", str(COMPOSE_FILE), *args],
+        cwd=REPO_ROOT,
+        timeout=timeout,
+        env=docker_env(),
+    )
+
+
+def docker_compose_output(*args: str, timeout: float | None = None) -> str:
+    cmd = ["docker", "compose", "-f", str(COMPOSE_FILE), *args]
+    print(f"+ {' '.join(cmd)}", flush=True)
+    return subprocess.check_output(
+        cmd,
+        cwd=REPO_ROOT,
+        text=True,
+        timeout=timeout,
+        env=docker_env(),
+    ).strip()
+
+
+def wait_for_container_health(service: str, timeout: float) -> None:
+    container_id = docker_compose_output("ps", "-q", service, timeout=30.0)
+    if not container_id:
+        return
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status = subprocess.check_output(
+            [
+                "docker",
+                "inspect",
+                "--format",
+                "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}",
+                container_id,
+            ],
+            text=True,
+            env=docker_env(),
+        ).strip()
+        if status in {"none", "healthy"}:
+            return
+        if status == "unhealthy":
+            raise RuntimeError(f"Docker service {service} became unhealthy")
+        time.sleep(1.0)
+    raise TimeoutError(f"Timed out waiting for Docker service {service} to become healthy")
 
 
 def start_docker_service(target: Target, timeout: float, startup_timeout: float) -> None:
@@ -215,6 +274,7 @@ def start_docker_service(target: Target, timeout: float, startup_timeout: float)
         ) from exc
     if target.wait_host is not None and target.wait_port is not None:
         wait_for_port(target.wait_host, target.wait_port, timeout)
+    wait_for_container_health(target.docker_service, timeout)
 
 
 def sql_fields() -> str:
@@ -231,13 +291,21 @@ def reset_sqlite(db_file: Path, table: str) -> None:
 
 def reset_postgresql(table: str) -> None:
     sql = f"DROP TABLE IF EXISTS {table}; CREATE TABLE {table} ({sql_fields()});"
-    run(["docker", "compose", "-f", str(COMPOSE_FILE), "exec", "-T", "postgresql", "psql", "-U", "ycsb", "-d", "ycsb", "-c", sql], cwd=REPO_ROOT)
+    run(
+        ["docker", "compose", "-f", str(COMPOSE_FILE), "exec", "-T", "postgresql", "psql", "-U", "ycsb", "-d", "ycsb", "-c", sql],
+        cwd=REPO_ROOT,
+        env=docker_env(),
+    )
 
 
 def reset_mysql(table: str) -> None:
     fields = ", ".join(f"FIELD{i} TEXT" for i in range(10))
     sql = f"DROP TABLE IF EXISTS {table}; CREATE TABLE {table} (YCSB_KEY VARCHAR(255) PRIMARY KEY, {fields});"
-    run(["docker", "compose", "-f", str(COMPOSE_FILE), "exec", "-T", "mysql", "mysql", "-uycsb", "-pycsb", "ycsb", "-e", sql], cwd=REPO_ROOT)
+    run(
+        ["docker", "compose", "-f", str(COMPOSE_FILE), "exec", "-T", "mysql", "mysql", "-uycsb", "-pycsb", "ycsb", "-e", sql],
+        cwd=REPO_ROOT,
+        env=docker_env(),
+    )
 
 
 def write_jdbc_props(path: Path, *, driver: str, url: str, user: str, password: str) -> None:

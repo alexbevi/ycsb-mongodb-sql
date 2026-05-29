@@ -47,3 +47,6 @@ Docker-backed targets start their service with `docker compose up -d <service>`.
 Use `--no-docker` when you already have the target running.
 If Docker image pulls are slow, raise `--docker-start-timeout`; the default is
 600 seconds.
+When `DOCKER_CONFIG` is unset, the harness uses `.bench/docker-config` with
+empty auths and a symlink to the existing Docker CLI plugins so public Docker
+Hub pulls do not depend on a local credential helper.
