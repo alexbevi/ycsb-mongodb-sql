@@ -23,6 +23,8 @@ upstream publishes a newer release artifact, update `YCSB_VERSION`, clear
 ## Requirements
 
 - Python 3.11+
+- `pymongo` for MongoDB-compatible server version detection in comparison
+  tables
 - Java runtime for YCSB
 - `javac` for `ferretdb` and `documentdb`, which compile a small modern MongoDB
   binding at runtime
@@ -34,12 +36,12 @@ upstream publishes a newer release artifact, update `YCSB_VERSION`, clear
 From this repository:
 
 ```bash
-python benchmark.py --target sqlite --record-count 1000 --operation-count 1000
-python benchmark.py --target mongodb --record-count 1000 --operation-count 1000
-python benchmark.py --target postgresql --record-count 1000 --operation-count 1000
-python benchmark.py --target mysql --record-count 1000 --operation-count 1000
-python benchmark.py --target ferretdb --record-count 1000 --operation-count 1000
-python benchmark.py --target documentdb --record-count 1000 --operation-count 1000
+python benchmark.py --source sqlite --record-count 1000 --operation-count 1000
+python benchmark.py --source mongodb --record-count 1000 --operation-count 1000
+python benchmark.py --source postgresql --record-count 1000 --operation-count 1000
+python benchmark.py --source mysql --record-count 1000 --operation-count 1000
+python benchmark.py --source ferretdb --record-count 1000 --operation-count 1000
+python benchmark.py --source documentdb --record-count 1000 --operation-count 1000
 ```
 
 The default action is `all`, which runs YCSB `load` followed by `run`.
@@ -47,21 +49,21 @@ Results are written under `results/<target>/<timestamp>/`.
 
 ## Compare two targets
 
-Use `--compare-to` to run the selected target and a second target with the same
-YCSB workload settings. The harness writes each raw YCSB output under the same
-result directory and creates `comparison.md` with a Markdown table.
+Use `--source` and `--target` to run two targets with the same YCSB workload
+settings. The harness writes each raw YCSB output under the same result
+directory and creates `comparison.md` with a Markdown table.
 
 ```bash
-python benchmark.py --target mongodb --compare-to postgresql \
+python benchmark.py --source mongodb --target postgresql \
   --record-count 1000 --operation-count 1000
 
-python benchmark.py --target documentdb --compare-to mysql \
+python benchmark.py --source documentdb --target mysql \
   --record-count 1000 --operation-count 1000
 
-python benchmark.py --target ferretdb --compare-to mongodb \
+python benchmark.py --source ferretdb --target mongodb \
   --record-count 1000 --operation-count 1000
 
-python benchmark.py --target mongodb --compare-to mongodb \
+python benchmark.py --source mongodb --target mongodb \
   --record-count 1000 --operation-count 1000
 ```
 
@@ -71,18 +73,25 @@ Comparison results are written under:
 results/compare-<left>-<right>/<timestamp>/comparison.md
 ```
 
-The table includes load/run throughput plus key read, insert, and update
-latency metrics. Raw outputs remain available as:
+The table header includes the actual database version detected at runtime when
+the target exposes one. For example, the MongoDB column uses the server version
+returned by `buildInfo`, not the Docker image tag. The table includes load/run
+throughput plus key read, insert, and update latency metrics. The `Difference`
+column is green when the source is better than the target and red when it is
+worse; higher throughput is better, lower latency is better.
+
+Raw outputs remain available as:
 
 ```text
-results/compare-<left>-<right>/<timestamp>/<left>/load.txt
-results/compare-<left>-<right>/<timestamp>/<left>/run.txt
-results/compare-<left>-<right>/<timestamp>/<right>/load.txt
-results/compare-<left>-<right>/<timestamp>/<right>/run.txt
+results/compare-<source>-<target>/<timestamp>/<source>/load.txt
+results/compare-<source>-<target>/<timestamp>/<source>/run.txt
+results/compare-<source>-<target>/<timestamp>/<target>/load.txt
+results/compare-<source>-<target>/<timestamp>/<target>/run.txt
 ```
 
 When both sides use the same target, the raw output directories are suffixed
-with `-left` and `-right`, for example `mongodb-left/` and `mongodb-right/`.
+with `-source` and `-target`, for example `mongodb-source/` and
+`mongodb-target/`.
 
 Use the `postgresql` target name for Postgres.
 
@@ -95,6 +104,10 @@ docker compose -f docker-compose.yml up -d <service>
 ```
 
 Use `--no-docker` when you already have the target running.
+
+The `mongodb` target uses `mongo:latest` and asks Docker Compose to pull the
+current image before starting the service. The comparison table reports the
+server's actual version number.
 
 `documentdb` means the DocumentDB project at
 [documentdb.io](https://documentdb.io/). The built-in target starts
@@ -111,7 +124,7 @@ The generic `jdbc` target is for SQL engines beyond the built-in `sqlite`,
 `postgresql`, and `mysql` targets:
 
 ```bash
-python benchmark.py --target jdbc \
+python benchmark.py --source jdbc \
   --jdbc-driver org.postgresql.Driver \
   --jdbc-url 'jdbc:postgresql://127.0.0.1:5432/ycsb' \
   --jdbc-user ycsb \
@@ -126,11 +139,11 @@ client before running `load`/`run`.
 ## Useful options
 
 ```bash
-python benchmark.py --target sqlite --workload workloada --threads 4
-python benchmark.py --target mongodb --uri 'mongodb://127.0.0.1:27017/ycsb?w=1'
-python benchmark.py --target ferretdb --uri 'mongodb://username:password@127.0.0.1:27019/ycsb?w=1'
-python benchmark.py --target documentdb --uri "$DOCUMENTDB_URI"
-python benchmark.py --target sqlite --dry-run
+python benchmark.py --source sqlite --workload workloada --threads 4
+python benchmark.py --source mongodb --uri 'mongodb://127.0.0.1:27017/ycsb?w=1'
+python benchmark.py --source ferretdb --uri 'mongodb://username:password@127.0.0.1:27019/ycsb?w=1'
+python benchmark.py --source documentdb --uri "$DOCUMENTDB_URI"
+python benchmark.py --source sqlite --dry-run
 ```
 
 `--dry-run` prints the resolved YCSB command without starting services,
@@ -152,7 +165,7 @@ When this repository is checked out as `tools/benchmark` inside
 `mdb-embedded`, the parent repo provides `tools/smongo-bench` as a thin wrapper:
 
 ```bash
-tools/smongo-bench --target smongo --compare-to sqlite \
+tools/smongo-bench --source smongo --target sqlite \
   --record-count 1000 --operation-count 1000
 ```
 

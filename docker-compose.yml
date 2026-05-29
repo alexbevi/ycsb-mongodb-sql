@@ -1,6 +1,7 @@
 services:
   mongodb:
-    image: mongo:7
+    image: mongo:latest
+    pull_policy: always
     ports:
       - "27017:27017"
     command: ["mongod", "--bind_ip_all"]

@@ -56,6 +56,20 @@ class Target:
     requires_uri: bool = False
 
 
+@dataclass(frozen=True)
+class BenchmarkRun:
+    phases: list[str]
+    version: str | None
+
+
+@dataclass(frozen=True)
+class ComparisonRow:
+    label: str
+    keys: Sequence[str]
+    integer: bool = False
+    higher_is_better: bool | None = True
+
+
 TARGETS: dict[str, Target] = {
     "smongo": Target(
         binding="mongodb",
@@ -326,6 +340,75 @@ def start_docker_service(target: Target, timeout: float, startup_timeout: float)
     wait_for_container_health(target.docker_service, timeout)
 
 
+def docker_compose_service_output(service: str, *cmd: str, timeout: float | None = None) -> str | None:
+    try:
+        return subprocess.check_output(
+            ["docker", "compose", "-f", str(COMPOSE_FILE), "exec", "-T", service, *cmd],
+            cwd=REPO_ROOT,
+            text=True,
+            timeout=timeout,
+            env=docker_env(),
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+
+
+def mongo_server_version(uri: str, timeout: float) -> str | None:
+    try:
+        from pymongo import MongoClient
+    except ImportError:
+        return None
+
+    client = MongoClient(uri, serverSelectionTimeoutMS=int(timeout * 1000))
+    try:
+        version = client.server_info().get("version")
+    except Exception:
+        return None
+    finally:
+        client.close()
+    return str(version) if version else None
+
+
+def target_version(name: str, args: argparse.Namespace, target: Target) -> str | None:
+    if args.dry_run:
+        return None
+    if name == "sqlite":
+        return sqlite3.sqlite_version
+    if name == "postgresql" and not args.no_docker:
+        version = docker_compose_service_output(
+            "postgresql",
+            "psql",
+            "-U",
+            "ycsb",
+            "-d",
+            "ycsb",
+            "-tAc",
+            "SHOW server_version",
+            timeout=args.timeout,
+        )
+        return version or None
+    if name == "mysql" and not args.no_docker:
+        version = docker_compose_service_output(
+            "mysql",
+            "mysql",
+            "-uycsb",
+            "-pycsb",
+            "-N",
+            "-B",
+            "ycsb",
+            "-e",
+            "SELECT VERSION()",
+            timeout=args.timeout,
+        )
+        return version or None
+    if target.binding == "mongodb":
+        uri = args.uri or target.default_uri
+        if uri:
+            return mongo_server_version(uri, args.timeout)
+    return None
+
+
 def sql_fields() -> str:
     fields = ", ".join(f"FIELD{i} TEXT" for i in range(10))
     return f"YCSB_KEY VARCHAR(255) PRIMARY KEY, {fields}"
@@ -566,63 +649,118 @@ def format_metric(value: str, *, integer: bool = False) -> str:
     return f"{number:,.2f}"
 
 
-def comparison_rows(phase: str) -> list[tuple[str, Sequence[str], bool]]:
+def comparison_rows(phase: str) -> list[ComparisonRow]:
     if phase == "load":
         return [
-            ("Throughput ops/sec", ("OVERALL.Throughput(ops/sec)",), False),
-            ("Insert operations", ("INSERT.Operations",), True),
-            ("Insert avg latency us", ("INSERT.AverageLatency(us)",), False),
-            ("Insert p95 latency us", ("INSERT.95thPercentileLatency(us)",), False),
-            ("Insert p99 latency us", ("INSERT.99thPercentileLatency(us)",), False),
+            ComparisonRow("Throughput ops/sec", ("OVERALL.Throughput(ops/sec)",)),
+            ComparisonRow("Insert operations", ("INSERT.Operations",), integer=True, higher_is_better=None),
+            ComparisonRow(
+                "Insert avg latency us",
+                ("INSERT.AverageLatency(us)",),
+                higher_is_better=False,
+            ),
+            ComparisonRow(
+                "Insert p95 latency us",
+                ("INSERT.95thPercentileLatency(us)",),
+                higher_is_better=False,
+            ),
+            ComparisonRow(
+                "Insert p99 latency us",
+                ("INSERT.99thPercentileLatency(us)",),
+                higher_is_better=False,
+            ),
         ]
     return [
-        ("Throughput ops/sec", ("OVERALL.Throughput(ops/sec)",), False),
-        ("Read operations", ("READ.Operations",), True),
-        ("Read avg latency us", ("READ.AverageLatency(us)",), False),
-        ("Read p95 latency us", ("READ.95thPercentileLatency(us)",), False),
-        ("Update operations", ("UPDATE.Operations",), True),
-        ("Update avg latency us", ("UPDATE.AverageLatency(us)",), False),
-        ("Update p95 latency us", ("UPDATE.95thPercentileLatency(us)",), False),
+        ComparisonRow("Throughput ops/sec", ("OVERALL.Throughput(ops/sec)",)),
+        ComparisonRow("Read operations", ("READ.Operations",), integer=True, higher_is_better=None),
+        ComparisonRow("Read avg latency us", ("READ.AverageLatency(us)",), higher_is_better=False),
+        ComparisonRow("Read p95 latency us", ("READ.95thPercentileLatency(us)",), higher_is_better=False),
+        ComparisonRow("Update operations", ("UPDATE.Operations",), integer=True, higher_is_better=None),
+        ComparisonRow("Update avg latency us", ("UPDATE.AverageLatency(us)",), higher_is_better=False),
+        ComparisonRow("Update p95 latency us", ("UPDATE.95thPercentileLatency(us)",), higher_is_better=False),
     ]
+
+
+def parse_metric_number(value: str) -> float | None:
+    if not value:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def color_difference(text: str, source_value: float, target_value: float, higher_is_better: bool | None) -> str:
+    if source_value == target_value or higher_is_better is None:
+        return text
+    source_better = source_value > target_value if higher_is_better else source_value < target_value
+    color = "green" if source_better else "red"
+    return f'<span style="color: {color}">{text}</span>'
+
+
+def format_difference(source: str, target: str, *, integer: bool, higher_is_better: bool | None) -> str:
+    source_number = parse_metric_number(source)
+    target_number = parse_metric_number(target)
+    if source_number is None or target_number is None:
+        return "-"
+    delta = source_number - target_number
+    delta_text = f"{int(delta):+,}" if integer else f"{delta:+,.2f}"
+    if target_number:
+        delta_text = f"{delta_text} ({delta / target_number:+,.2%})"
+    else:
+        delta_text = f"{delta_text} (n/a)"
+    return color_difference(delta_text, source_number, target_number, higher_is_better)
+
+
+def versioned_label(name: str, version: str | None) -> str:
+    return f"{name} {version}" if version else name
 
 
 def write_comparison_table(
     result_dir: Path,
-    left_name: str,
-    right_name: str,
+    source_name: str,
+    target_name: str,
     phases: Sequence[str],
     *,
-    left_dir_name: str | None = None,
-    right_dir_name: str | None = None,
-    left_column_name: str | None = None,
-    right_column_name: str | None = None,
+    source_dir_name: str | None = None,
+    target_dir_name: str | None = None,
+    source_column_name: str | None = None,
+    target_column_name: str | None = None,
 ) -> Path:
     path = result_dir / "comparison.md"
-    left_dir = left_dir_name or left_name
-    right_dir = right_dir_name or right_name
-    left_column = left_column_name or left_name
-    right_column = right_column_name or right_name
+    source_dir = source_dir_name or source_name
+    target_dir = target_dir_name or target_name
+    source_column = source_column_name or source_name
+    target_column = target_column_name or target_name
     lines = [
-        f"# {left_name} vs {right_name}",
+        f"# {source_name} vs {target_name}",
         "",
     ]
     for phase in phases:
-        left_metrics = parse_ycsb_metrics(result_dir / left_dir / f"{phase}.txt")
-        right_metrics = parse_ycsb_metrics(result_dir / right_dir / f"{phase}.txt")
-        if not left_metrics and not right_metrics:
+        source_metrics = parse_ycsb_metrics(result_dir / source_dir / f"{phase}.txt")
+        target_metrics = parse_ycsb_metrics(result_dir / target_dir / f"{phase}.txt")
+        if not source_metrics and not target_metrics:
             continue
         lines.extend(
             [
                 f"## {phase}",
                 "",
-                f"| Metric | {left_column} | {right_column} |",
-                "| --- | ---: | ---: |",
+                f"| Metric | {source_column} | {target_column} | Difference |",
+                "| --- | ---: | ---: | ---: |",
             ]
         )
-        for label, keys, integer in comparison_rows(phase):
-            left_value = format_metric(metric_value(left_metrics, keys), integer=integer)
-            right_value = format_metric(metric_value(right_metrics, keys), integer=integer)
-            lines.append(f"| {label} | {left_value} | {right_value} |")
+        for row in comparison_rows(phase):
+            source_raw = metric_value(source_metrics, row.keys)
+            target_raw = metric_value(target_metrics, row.keys)
+            source_value = format_metric(source_raw, integer=row.integer)
+            target_value = format_metric(target_raw, integer=row.integer)
+            difference = format_difference(
+                source_raw,
+                target_raw,
+                integer=row.integer,
+                higher_is_better=row.higher_is_better,
+            )
+            lines.append(f"| {row.label} | {source_value} | {target_value} | {difference} |")
         lines.append("")
     path.write_text("\n".join(lines), encoding="utf-8")
     return path
@@ -638,7 +776,8 @@ def resolved_phases(action: str) -> list[str]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run YCSB benchmarks against smongo and comparable targets.")
-    parser.add_argument("--target", required=True, choices=sorted(TARGETS))
+    parser.add_argument("--source", choices=sorted(TARGETS), help="Source database target to benchmark")
+    parser.add_argument("--target", choices=sorted(TARGETS), help="Comparison database target")
     parser.add_argument("--action", choices=["prepare", "load", "run", "all"], default="all")
     parser.add_argument("--workload", default=DEFAULT_WORKLOAD)
     parser.add_argument("--record-count", type=int, default=DEFAULT_RECORD_COUNT)
@@ -665,12 +804,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--compare-smongo",
         action="store_true",
-        help="Run smongo and the selected target, then write a side-by-side comparison table",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--compare-to",
         choices=sorted(TARGETS),
-        help="Run the selected target and this second target, then write a side-by-side comparison table",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument(
@@ -679,10 +818,38 @@ def parse_args() -> argparse.Namespace:
         default=600.0,
         help="Maximum seconds to allow docker compose startup, including image pulls",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    normalize_args(parser, args)
+    return args
 
 
-def run_benchmark(args: argparse.Namespace, result_dir: Path) -> list[str]:
+def normalize_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.compare_to:
+        if args.source is not None and args.target is not None and args.target != args.compare_to:
+            parser.error("use only one comparison target")
+        if args.source is None:
+            if args.target is None:
+                parser.error("--source is required when using --compare-to")
+            args.source = args.target
+        args.target = args.compare_to
+    elif args.compare_smongo:
+        if args.source is None:
+            if args.target is None:
+                parser.error("--target is required when using --compare-smongo")
+            args.source = "smongo"
+        elif args.source != "smongo":
+            args.target = args.source
+            args.source = "smongo"
+        elif args.target is None:
+            parser.error("--target is required when using --compare-smongo")
+    elif args.source is None:
+        if args.target is None:
+            parser.error("--source is required")
+        args.source = args.target
+        args.target = None
+
+
+def run_benchmark(args: argparse.Namespace, result_dir: Path) -> BenchmarkRun:
     target = TARGETS[args.target]
     if target.requires_uri and not args.uri and not target.default_uri:
         raise SystemExit(f"--target {args.target} requires --uri or DOCUMENTDB_URI")
@@ -697,6 +864,7 @@ def run_benchmark(args: argparse.Namespace, result_dir: Path) -> list[str]:
         smongo_process = start_smongo(args, result_dir)
 
     try:
+        version = target_version(args.target, args, target)
         home = ycsb_home(target.binding)
         props_file: Path | None = None
         classpath: list[Path] = []
@@ -750,7 +918,7 @@ def run_benchmark(args: argparse.Namespace, result_dir: Path) -> list[str]:
                 tee_command(cmd, output_file)
 
         print(f"Results: {result_dir}")
-        return phases
+        return BenchmarkRun(phases=phases, version=version)
     finally:
         if smongo_process is not None:
             smongo_process.terminate()
@@ -763,9 +931,10 @@ def run_benchmark(args: argparse.Namespace, result_dir: Path) -> list[str]:
 def benchmark_args(args: argparse.Namespace, target_name: str) -> argparse.Namespace:
     copied = copy.copy(args)
     copied.target = target_name
+    copied.source = target_name
     copied.compare_smongo = False
     copied.compare_to = None
-    if target_name != args.target:
+    if target_name != args.source:
         copied.uri = None
         copied.jdbc_driver = None
         copied.jdbc_url = None
@@ -775,34 +944,36 @@ def benchmark_args(args: argparse.Namespace, target_name: str) -> argparse.Names
     return copied
 
 
-def compare_targets(args: argparse.Namespace, left_name: str, right_name: str) -> None:
+def compare_targets(args: argparse.Namespace, source_name: str, target_name: str) -> None:
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    result_dir = args.output_dir / f"compare-{left_name}-{right_name}" / stamp
-    if left_name == right_name:
-        left_dir = f"{left_name}-left"
-        right_dir = f"{right_name}-right"
-        left_label = f"{left_name} #1"
-        right_label = f"{right_name} #2"
+    result_dir = args.output_dir / f"compare-{source_name}-{target_name}" / stamp
+    if source_name == target_name:
+        source_dir = f"{source_name}-source"
+        target_dir = f"{target_name}-target"
+        source_suffix = " #1"
+        target_suffix = " #2"
     else:
-        left_dir = left_name
-        right_dir = right_name
-        left_label = left_name
-        right_label = right_name
+        source_dir = source_name
+        target_dir = target_name
+        source_suffix = ""
+        target_suffix = ""
 
-    left_args = benchmark_args(args, left_name)
-    right_args = benchmark_args(args, right_name)
+    source_args = benchmark_args(args, source_name)
+    target_args = benchmark_args(args, target_name)
 
-    phases = run_benchmark(left_args, result_dir / left_dir)
-    run_benchmark(right_args, result_dir / right_dir)
+    source_run = run_benchmark(source_args, result_dir / source_dir)
+    target_run = run_benchmark(target_args, result_dir / target_dir)
+    source_label = f"{versioned_label(source_name, source_run.version)}{source_suffix}"
+    target_label = f"{versioned_label(target_name, target_run.version)}{target_suffix}"
     comparison = write_comparison_table(
         result_dir,
-        left_name,
-        right_name,
-        phases,
-        left_dir_name=left_dir,
-        right_dir_name=right_dir,
-        left_column_name=left_label,
-        right_column_name=right_label,
+        versioned_label(source_name, source_run.version),
+        versioned_label(target_name, target_run.version),
+        source_run.phases,
+        source_dir_name=source_dir,
+        target_dir_name=target_dir,
+        source_column_name=source_label,
+        target_column_name=target_label,
     )
     print(comparison.read_text(encoding="utf-8"))
     print(f"Comparison: {comparison}")
@@ -810,15 +981,12 @@ def compare_targets(args: argparse.Namespace, left_name: str, right_name: str) -
 
 def main() -> int:
     args = parse_args()
-    if args.compare_smongo and args.compare_to:
-        raise SystemExit("use only one of --compare-smongo or --compare-to")
-    if args.compare_smongo:
-        compare_targets(args, "smongo", args.target)
-    elif args.compare_to:
-        compare_targets(args, args.target, args.compare_to)
+    if args.target:
+        compare_targets(args, args.source, args.target)
     else:
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-        run_benchmark(args, args.output_dir / args.target / stamp)
+        args.target = args.source
+        run_benchmark(args, args.output_dir / args.source / stamp)
     return 0
 
 
