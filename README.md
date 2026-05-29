@@ -1,6 +1,7 @@
 # smongo benchmark harness
 
-This repository wraps YCSB 0.17.0 so the same workload can run against:
+This repository wraps YCSB 0.17.0, the latest upstream YCSB release artifact,
+so the same workload can run against:
 
 - `smongo` through the smongo MongoDB wire server
 - `mongodb` through a Docker MongoDB instance
@@ -10,7 +11,9 @@ This repository wraps YCSB 0.17.0 so the same workload can run against:
 - `sqlite` through the YCSB JDBC binding
 - `jdbc` through a supplied JDBC driver, URL, and driver jar
 
-YCSB is downloaded into `.bench/` on first use and is not checked in.
+YCSB is downloaded into `.bench/` on first use and is not checked in. Docker
+targets use `docker compose`; `ferretdb` and `documentdb` also compile a small
+modern MongoDB binding, so they require `javac` on `PATH`.
 
 ## Quick start
 
@@ -19,7 +22,9 @@ From the parent `mdb-embedded` checkout:
 ```bash
 tools/smongo-bench --target smongo --record-count 1000 --operation-count 1000
 tools/smongo-bench --target mongodb --record-count 1000 --operation-count 1000
+tools/smongo-bench --target ferretdb --record-count 1000 --operation-count 1000
 tools/smongo-bench --target postgresql --record-count 1000 --operation-count 1000
+tools/smongo-bench --target mysql --record-count 1000 --operation-count 1000
 tools/smongo-bench --target sqlite --record-count 1000 --operation-count 1000
 ```
 
@@ -37,11 +42,26 @@ Results are written under `results/<target>/<timestamp>/`.
 ```bash
 python benchmark.py --target smongo --workload workloada --threads 4
 python benchmark.py --target mongodb --uri 'mongodb://127.0.0.1:27017/ycsb?w=1'
+python benchmark.py --target ferretdb --uri 'mongodb://username:password@127.0.0.1:27019/ycsb?w=1'
 python benchmark.py --target documentdb --uri "$DOCUMENTDB_URI"
 python benchmark.py --target jdbc --jdbc-driver org.postgresql.Driver \
   --jdbc-url 'jdbc:postgresql://127.0.0.1:5432/ycsb' \
   --jdbc-user ycsb --jdbc-password ycsb --jdbc-jar ./postgresql.jar
 ```
+
+`documentdb` is a user-supplied MongoDB-compatible endpoint. Set
+`DOCUMENTDB_URI` or pass `--uri`; for AWS DocumentDB, include whatever TLS,
+CA bundle, replica set, read preference, and `retryWrites=false` options your
+cluster requires. The target uses the modern MongoDB binding rather than the
+stock YCSB MongoDB binding so newer MongoDB-compatible servers do not have to
+support legacy `OP_QUERY` handshakes.
+
+The generic `jdbc` target is for SQL engines beyond the built-in `sqlite`,
+`postgresql`, and `mysql` targets. Supply the JDBC driver class, URL, user,
+password, and one or more comma-separated local paths or URLs in `--jdbc-jar`.
+The built-in SQL targets create/reset the YCSB table automatically; generic
+JDBC targets expect the table schema to already exist unless your target driver
+or database creates it separately.
 
 Docker-backed targets start their service with `docker compose up -d <service>`.
 Use `--no-docker` when you already have the target running.
